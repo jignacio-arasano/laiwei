@@ -10,6 +10,8 @@ const Icons = {
   back: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>`,
   up: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`,
   down: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+  edit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`,
+  diet: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8c0-3-2-5-4-5-1 0-1.5.7-2 .7S11 3 10 3C7 3 5 6 5 10c0 6 4 11 6 11s3-1 3-1"/><path d="M15 3c0 1.5-1 2-1 3.5"/><circle cx="17" cy="16" r="4.5"/><path d="M17 13.2V16l1.6 1.6"/></svg>`,
 };
 
 function escapeHtml(str) {
@@ -73,14 +75,17 @@ const App = {
   async init() {
     await openDB();
     await Repo.seedFase1IfEmpty();
+    await Repo.seedDietPlanIfEmpty();
     App.nav.render();
     await App.session.load();
     await App.volume.load();
     await App.routines.load();
+    await App.diet.load();
     App.nav.goTo("session");
   },
 
   nav: {
+    views: ["session", "routines", "volume", "diet"],
     render() {
       document.getElementById("bottom-nav").innerHTML = `
         <button class="nav-btn" id="nav-session" onclick="App.nav.goTo('session')">
@@ -91,17 +96,21 @@ const App = {
         </button>
         <button class="nav-btn" id="nav-volume" onclick="App.nav.goTo('volume')">
           ${Icons.volume}<span>Volumen</span>
+        </button>
+        <button class="nav-btn" id="nav-diet" onclick="App.nav.goTo('diet')">
+          ${Icons.diet}<span>Dieta</span>
         </button>`;
     },
     goTo(view) {
       App.state.view = view;
-      ["session", "routines", "volume"].forEach((v) => {
+      App.nav.views.forEach((v) => {
         document.getElementById("view-" + v).classList.toggle("hidden", v !== view);
         document.getElementById("nav-" + v).classList.toggle("active", v === view);
       });
       if (view === "volume") App.volume.refresh();
       if (view === "routines") App.routines.render();
       if (view === "session") App.session.refresh();
+      if (view === "diet") App.diet.refresh();
     },
   },
 
@@ -846,6 +855,490 @@ App.volume = {
     await Repo.upsertMuscleGroupTarget({ muscleGroup: group, mev, mav, mrv });
     App.volume.s.editing[group] = false;
     await App.volume.refresh();
+  },
+};
+
+// =======================================================================
+// Dieta
+// =======================================================================
+App.diet = {
+  s: {
+    subview: "plan",
+    profile: null,
+    plan: { meals: [], dayTotals: { kcal: 0, proteinG: 0, carbsG: 0, fatG: 0 } },
+    foods: [],
+    weightLogs: [],
+    addingFoodToMeal: null,
+    pickedFoodId: null,
+    showNewMeal: false,
+    showFoodForm: false,
+    editingFoodId: null,
+  },
+
+  async load() {
+    const s = App.diet.s;
+    s.profile = await Repo.getDietProfile();
+    s.plan = await Repo.getDietPlan();
+    s.foods = await Repo.getFoods();
+    s.weightLogs = await Repo.getBodyWeightLogs();
+  },
+
+  async refresh() {
+    await App.diet.load();
+    App.diet.render();
+  },
+
+  render() {
+    const s = App.diet.s;
+    const el = document.getElementById("view-diet");
+    el.innerHTML = `
+      <div class="topbar">
+        <h1>Dieta</h1>
+        <div class="subtitle">Perfil, plan de comidas y peso corporal</div>
+      </div>
+      <div class="view">
+        <div class="chip-row" style="margin-bottom:12px;">
+          <button class="chip ${s.subview === "plan" ? "selected" : ""}" onclick="App.diet.goSub('plan')">Plan</button>
+          <button class="chip ${s.subview === "profile" ? "selected" : ""}" onclick="App.diet.goSub('profile')">Perfil</button>
+          <button class="chip ${s.subview === "foods" ? "selected" : ""}" onclick="App.diet.goSub('foods')">Alimentos</button>
+          <button class="chip ${s.subview === "weight" ? "selected" : ""}" onclick="App.diet.goSub('weight')">Peso</button>
+        </div>
+        <div id="diet-subview"></div>
+      </div>`;
+    App.diet.renderSub();
+  },
+
+  goSub(sub) {
+    App.diet.s.subview = sub;
+    App.diet.render();
+  },
+
+  renderSub() {
+    const s = App.diet.s;
+    const el = document.getElementById("diet-subview");
+    if (!el) return;
+    if (s.subview === "plan") {
+      el.innerHTML = App.diet.renderPlan();
+      if (s.addingFoodToMeal != null) App.diet.mountFoodPickerForMeal();
+    } else if (s.subview === "profile") {
+      el.innerHTML = App.diet.renderProfile();
+    } else if (s.subview === "foods") {
+      el.innerHTML = App.diet.renderFoods();
+    } else if (s.subview === "weight") {
+      el.innerHTML = App.diet.renderWeight();
+    }
+  },
+
+  // ---- Plan de comidas ----
+  renderPlan() {
+    const s = App.diet.s;
+    const plan = s.plan;
+    const profile = s.profile;
+    let html = "";
+
+    if (profile) {
+      const t = plan.dayTotals;
+      html += `<div class="card accent">
+        <div class="card-title" style="color:var(--primary-dark);">Total del plan vs. objetivo</div>
+        ${App.diet.macroRowHtml("Calorías", t.kcal, profile.targetKcal, "kcal")}
+        ${App.diet.macroRowHtml("Proteína", t.proteinG, profile.targetProteinG, "g")}
+        ${App.diet.macroRowHtml("Carbohidratos", t.carbsG, profile.targetCarbsG, "g")}
+        ${App.diet.macroRowHtml("Grasas", t.fatG, profile.targetFatG, "g")}
+      </div>`;
+    } else {
+      html += `<div class="muted" style="margin-bottom:10px;">Todavía no cargaste tu perfil — anda a la pestaña "Perfil" para fijar tus objetivos diarios.</div>`;
+    }
+
+    html += plan.meals.length
+      ? plan.meals.map((m, i) => App.diet.mealCardHtml(m, i, plan.meals.length)).join("")
+      : `<div class="empty-state">Todavía no armaste ninguna comida.</div>`;
+
+    if (s.showNewMeal) {
+      html += `<div class="card">
+        <div class="card-title">Nueva comida</div>
+        <div class="field"><label>Nombre</label><input id="new-meal-name" placeholder="Ej: Merienda"></div>
+        <div class="field"><label>Horario (opcional)</label><input id="new-meal-schedule" placeholder="Ej: 17:00–18:00 hs"></div>
+        <div class="row">
+          <button class="btn btn-ghost" onclick="App.diet.toggleNewMeal()">Cancelar</button>
+          <button class="btn btn-primary" onclick="App.diet.saveNewMeal()">Crear</button>
+        </div>
+      </div>`;
+    } else {
+      html += `<button class="btn btn-ghost btn-block" onclick="App.diet.toggleNewMeal()">+ Agregar comida</button>`;
+    }
+    return html;
+  },
+
+  macroRowHtml(label, actual, target, unit) {
+    const t = target || 0;
+    const pct = t > 0 ? Math.min(100, (actual / t) * 100) : 0;
+    const over = t > 0 && actual > t * 1.05;
+    return `<div style="margin-bottom:8px;">
+      <div class="row"><span>${label}</span><span class="muted">${Math.round(actual)} / ${Math.round(t)} ${unit}</span></div>
+      <div class="volume-bar"><div class="volume-bar-fill ${over ? "zone-sobre" : "zone-optimo"}" style="width:${pct}%;"></div></div>
+    </div>`;
+  },
+
+  mealCardHtml(m, i, total) {
+    const s = App.diet.s;
+    const meal = m.meal;
+    const totals = m.totals;
+    let html = `<div class="card">
+      <div class="row">
+        <div><strong>${escapeHtml(meal.name)}</strong>${meal.scheduleLabel ? ` <span class="muted">· ${escapeHtml(meal.scheduleLabel)}</span>` : ""}</div>
+        <div class="row" style="gap:2px; flex:0 0 auto;">
+          <button class="icon-btn" ${i === 0 ? "disabled" : ""} onclick="App.diet.moveMeal(${meal.id}, -1)">${Icons.up}</button>
+          <button class="icon-btn" ${i === total - 1 ? "disabled" : ""} onclick="App.diet.moveMeal(${meal.id}, 1)">${Icons.down}</button>
+          <button class="icon-btn danger" onclick="App.diet.removeMeal(${meal.id})">${Icons.trash}</button>
+        </div>
+      </div>`;
+
+    html += m.items.length
+      ? m.items
+          .map(
+            (it) => `<div class="set-row">
+        <div>
+          <strong>${escapeHtml(it.food.name)}</strong> — ${App.diet.formatQuantity(it.quantity)} × ${escapeHtml(it.food.portionLabel)}
+          <div class="muted">${Math.round(it.food.kcal * it.quantity)} kcal · P ${fmt1(it.food.proteinG * it.quantity)}g · C ${fmt1(it.food.carbsG * it.quantity)}g · G ${fmt1(it.food.fatG * it.quantity)}g</div>
+        </div>
+        <div class="row" style="gap:6px; flex:0 0 auto;">
+          <input type="number" step="0.5" value="${it.quantity}" style="width:56px; border:1.5px solid var(--border); border-radius:8px; padding:6px; font-family:inherit;" onchange="App.diet.updateItemQuantity(${it.id}, this.value)">
+          <button class="icon-btn danger" onclick="App.diet.removeItem(${it.id})">${Icons.trash}</button>
+        </div>
+      </div>`
+          )
+          .join("")
+      : `<div class="empty-state">Sin alimentos todavía.</div>`;
+
+    html += `<div class="muted" style="margin-top:8px;">Total: ${Math.round(totals.kcal)} kcal · P ${fmt1(totals.proteinG)}g · C ${fmt1(totals.carbsG)}g · G ${fmt1(totals.fatG)}g</div>`;
+
+    if (s.addingFoodToMeal === meal.id) {
+      html += App.diet.renderAddFoodPanel(meal.id);
+    } else {
+      html += `<button class="link-btn" style="margin-top:8px;" onclick="App.diet.toggleAddFood(${meal.id})">+ Agregar alimento</button>`;
+    }
+    html += `</div>`;
+    return html;
+  },
+
+  formatQuantity(q) {
+    return (Math.round(q * 100) / 100).toString();
+  },
+
+  renderAddFoodPanel(mealId) {
+    const s = App.diet.s;
+    const pickedName = s.foods.find((f) => f.id === s.pickedFoodId)?.name;
+    let html = `<div style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--border);">`;
+    if (s.pickedFoodId) {
+      html += `<div class="row"><span><strong>${escapeHtml(pickedName || "")}</strong></span><button class="link-btn" onclick="App.diet.clearPickedFood()">Cambiar</button></div>
+        <div class="field-row" style="margin-top:8px; align-items:flex-end;">
+          <div class="field"><label>Cantidad (× porción base)</label><input id="add-food-qty" type="number" step="0.5" value="1"></div>
+          <button class="btn btn-primary" style="margin-bottom:12px;" onclick="App.diet.confirmAddFoodToMeal(${mealId})">Agregar</button>
+        </div>`;
+    } else if (s.foods.length === 0) {
+      html += `<div class="muted">Todavía no cargaste alimentos — andá a la pestaña "Alimentos".</div>`;
+    } else {
+      html += Picker.html("diet-food-picker", "Buscar alimento...");
+    }
+    html += `<button class="link-btn" onclick="App.diet.toggleAddFood(${mealId})">Cancelar</button>`;
+    html += `</div>`;
+    return html;
+  },
+
+  mountFoodPickerForMeal() {
+    const s = App.diet.s;
+    if (s.pickedFoodId) return;
+    Picker.mount(
+      "diet-food-picker",
+      s.foods.map((f) => ({ ...f, searchText: f.name })),
+      (f) => `<div class="exercise-picker-item" onclick="App.diet.pickFoodForMeal(${f.id})">
+        <div class="name">${escapeHtml(f.name)}</div>
+        <div class="group">${escapeHtml(f.portionLabel)} — ${f.kcal} kcal</div>
+      </div>`
+    );
+    setTimeout(() => Picker.refresh("diet-food-picker"), 0);
+  },
+
+  toggleAddFood(mealId) {
+    const s = App.diet.s;
+    s.addingFoodToMeal = s.addingFoodToMeal === mealId ? null : mealId;
+    s.pickedFoodId = null;
+    App.diet.renderSub();
+  },
+  pickFoodForMeal(foodId) {
+    App.diet.s.pickedFoodId = foodId;
+    App.diet.renderSub();
+  },
+  clearPickedFood() {
+    App.diet.s.pickedFoodId = null;
+    App.diet.renderSub();
+  },
+  async confirmAddFoodToMeal(mealId) {
+    const qty = parseFloat(document.getElementById("add-food-qty").value);
+    if (isNaN(qty) || qty <= 0) return;
+    await Repo.addMealItem(mealId, App.diet.s.pickedFoodId, qty);
+    App.diet.s.addingFoodToMeal = null;
+    App.diet.s.pickedFoodId = null;
+    await App.diet.refresh();
+  },
+  async updateItemQuantity(itemId, value) {
+    const qty = parseFloat(value);
+    if (isNaN(qty) || qty < 0) return;
+    await Repo.updateMealItemQuantity(itemId, qty);
+    await App.diet.refresh();
+  },
+  async removeItem(itemId) {
+    await Repo.removeMealItem(itemId);
+    await App.diet.refresh();
+  },
+  toggleNewMeal() {
+    App.diet.s.showNewMeal = !App.diet.s.showNewMeal;
+    App.diet.renderSub();
+  },
+  async saveNewMeal() {
+    const name = document.getElementById("new-meal-name").value.trim();
+    const schedule = document.getElementById("new-meal-schedule").value.trim();
+    if (!name) return;
+    await Repo.addMeal(name, schedule);
+    App.diet.s.showNewMeal = false;
+    await App.diet.refresh();
+  },
+  async moveMeal(mealId, direction) {
+    await Repo.moveMeal(mealId, direction);
+    await App.diet.refresh();
+  },
+  async removeMeal(mealId) {
+    await Repo.removeMeal(mealId);
+    await App.diet.refresh();
+  },
+
+  // ---- Perfil ----
+  renderProfile() {
+    const p = App.diet.s.profile || {};
+    return `
+      <div class="card">
+        <div class="card-title">Datos personales</div>
+        <div class="field-row">
+          <div class="field"><label>Nombre</label><input id="diet-name" value="${escapeHtml(p.name || "")}"></div>
+          <div class="field"><label>Edad</label><input id="diet-age" type="number" value="${p.age ?? ""}"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Altura (cm)</label><input id="diet-height" type="number" value="${p.heightCm ?? ""}"></div>
+          <div class="field"><label>Peso (kg)</label><input id="diet-weight" type="number" step="0.1" value="${p.weightKg ?? ""}"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Género</label>
+            <select id="diet-gender" style="width:100%; border:1.5px solid var(--border); border-radius:8px; padding:11px 12px; font-size:15px; font-family:inherit; background:var(--surface-2);">
+              <option value="M" ${p.gender !== "F" ? "selected" : ""}>Masculino</option>
+              <option value="F" ${p.gender === "F" ? "selected" : ""}>Femenino</option>
+            </select>
+          </div>
+          <div class="field"><label>Factor de actividad</label><input id="diet-activity" type="number" step="0.05" value="${p.activityFactor ?? 1.5}"></div>
+        </div>
+        <div class="muted" id="diet-bmr-info">${App.diet.bmrInfoText(p)}</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Objetivos diarios</div>
+        <div class="field-row">
+          <div class="field"><label>Ajuste calórico (kcal)</label><input id="diet-kcaladj" type="number" value="${p.kcalAdjustment ?? -500}"></div>
+          <div class="field"><label>Proteína (g/kg)</label><input id="diet-proteinperkg" type="number" step="0.01" value="${p.proteinPerKg ?? 2}"></div>
+        </div>
+        <button class="btn btn-ghost" style="margin-bottom:10px;" onclick="App.diet.recalcSuggested()">Recalcular sugerido a partir del perfil</button>
+        <div class="field-row">
+          <div class="field"><label>Calorías (kcal/día)</label><input id="diet-target-kcal" type="number" value="${p.targetKcal ?? ""}"></div>
+          <div class="field"><label>Proteína (g/día)</label><input id="diet-target-protein" type="number" value="${p.targetProteinG ?? ""}"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Carbohidratos (g/día)</label><input id="diet-target-carbs" type="number" value="${p.targetCarbsG ?? ""}"></div>
+          <div class="field"><label>Grasas (g/día)</label><input id="diet-target-fat" type="number" value="${p.targetFatG ?? ""}"></div>
+        </div>
+        <div class="field"><label>Notas</label><textarea id="diet-notes" rows="4">${escapeHtml(p.notes || "")}</textarea></div>
+        <button class="btn btn-primary btn-block" onclick="App.diet.saveProfile()">Guardar perfil y objetivos</button>
+      </div>`;
+  },
+
+  bmrInfoText(p) {
+    if (!p.weightKg || !p.heightCm || !p.age) return "Completá altura, peso y edad para ver el BMR y el TDEE.";
+    const bmr = Metrics.harrisBenedictBmr(p.weightKg, p.heightCm, p.age, p.gender);
+    const tdeeVal = Metrics.tdee(bmr, p.activityFactor || 1.5);
+    return `BMR (Harris-Benedict): ${Math.round(bmr)} kcal · TDEE (factor ${p.activityFactor || 1.5}): ${Math.round(tdeeVal)} kcal`;
+  },
+
+  readProfileForm() {
+    return {
+      name: document.getElementById("diet-name").value.trim(),
+      age: parseInt(document.getElementById("diet-age").value, 10) || 0,
+      heightCm: parseFloat(document.getElementById("diet-height").value) || 0,
+      weightKg: parseFloat(document.getElementById("diet-weight").value) || 0,
+      gender: document.getElementById("diet-gender").value,
+      activityFactor: parseFloat(document.getElementById("diet-activity").value) || 1.5,
+      kcalAdjustment: parseFloat(document.getElementById("diet-kcaladj").value) || 0,
+      proteinPerKg: parseFloat(document.getElementById("diet-proteinperkg").value) || 0,
+      targetKcal: parseFloat(document.getElementById("diet-target-kcal").value) || 0,
+      targetProteinG: parseFloat(document.getElementById("diet-target-protein").value) || 0,
+      targetCarbsG: parseFloat(document.getElementById("diet-target-carbs").value) || 0,
+      targetFatG: parseFloat(document.getElementById("diet-target-fat").value) || 0,
+      notes: document.getElementById("diet-notes").value,
+    };
+  },
+
+  recalcSuggested() {
+    const draft = App.diet.readProfileForm();
+    const sug = Metrics.suggestedMacros(draft);
+    document.getElementById("diet-target-kcal").value = sug.targetKcal;
+    document.getElementById("diet-target-protein").value = sug.proteinG;
+    document.getElementById("diet-target-carbs").value = sug.carbsG;
+    document.getElementById("diet-bmr-info").textContent =
+      `BMR: ${sug.bmr} kcal · TDEE: ${sug.tdee} kcal · Calorías sugeridas: ${sug.targetKcal} kcal`;
+  },
+
+  async saveProfile() {
+    const profile = App.diet.readProfileForm();
+    await Repo.upsertDietProfile(profile);
+    await App.diet.refresh();
+  },
+
+  // ---- Alimentos ----
+  renderFoods() {
+    const s = App.diet.s;
+    let html = `<div class="card">
+      <div class="card-title">Base de alimentos</div>
+      <div class="muted" style="margin-bottom:8px;">Cada alimento tiene una porción base con sus macros. Se puede reusar el mismo alimento en varias comidas con distinta cantidad.</div>
+      <button class="btn btn-ghost" onclick="App.diet.toggleFoodForm()">+ Nuevo alimento</button>
+      ${s.showFoodForm ? App.diet.renderFoodForm() : ""}
+    </div>`;
+    html += s.foods.length
+      ? s.foods.map((f) => App.diet.foodRowHtml(f)).join("")
+      : `<div class="empty-state">Todavía no cargaste alimentos.</div>`;
+    return html;
+  },
+
+  foodRowHtml(f) {
+    if (App.diet.s.editingFoodId === f.id) return App.diet.renderFoodForm(f);
+    return `<div class="card">
+      <div class="row">
+        <strong>${escapeHtml(f.name)}</strong>
+        <div class="row" style="gap:2px; flex:0 0 auto;">
+          <button class="icon-btn" onclick="App.diet.editFood(${f.id})">${Icons.edit}</button>
+          <button class="icon-btn danger" onclick="App.diet.removeFood(${f.id})">${Icons.trash}</button>
+        </div>
+      </div>
+      <div class="muted">Porción: ${escapeHtml(f.portionLabel)} — ${f.kcal} kcal · P ${f.proteinG}g · C ${f.carbsG}g · G ${f.fatG}g</div>
+      ${f.note ? `<div class="muted" style="margin-top:4px;">${escapeHtml(f.note)}</div>` : ""}
+    </div>`;
+  },
+
+  renderFoodForm(existing) {
+    const f = existing || { name: "", portionLabel: "", kcal: "", proteinG: "", carbsG: "", fatG: "", note: "" };
+    return `<div class="card" style="border:1px dashed var(--border); box-shadow:none;">
+      <div class="field"><label>Nombre</label><input id="food-name" value="${escapeHtml(f.name)}"></div>
+      <div class="field"><label>Porción base</label><input id="food-portion" placeholder="Ej: 100 g, 1 unidad, 250 ml" value="${escapeHtml(f.portionLabel)}"></div>
+      <div class="field-row">
+        <div class="field"><label>Kcal</label><input id="food-kcal" type="number" value="${f.kcal}"></div>
+        <div class="field"><label>Proteína (g)</label><input id="food-protein" type="number" value="${f.proteinG}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Carbohidratos (g)</label><input id="food-carbs" type="number" value="${f.carbsG}"></div>
+        <div class="field"><label>Grasas (g)</label><input id="food-fat" type="number" value="${f.fatG}"></div>
+      </div>
+      <div class="field"><label>Nota (opcional)</label><input id="food-note" value="${escapeHtml(f.note || "")}"></div>
+      <div class="row">
+        <button class="btn btn-ghost" onclick="App.diet.cancelFoodForm()">Cancelar</button>
+        <button class="btn btn-primary" onclick="App.diet.saveFood(${existing ? existing.id : "null"})">Guardar</button>
+      </div>
+    </div>`;
+  },
+
+  toggleFoodForm() {
+    App.diet.s.showFoodForm = !App.diet.s.showFoodForm;
+    App.diet.s.editingFoodId = null;
+    App.diet.renderSub();
+  },
+  editFood(id) {
+    App.diet.s.editingFoodId = id;
+    App.diet.s.showFoodForm = false;
+    App.diet.renderSub();
+  },
+  cancelFoodForm() {
+    App.diet.s.showFoodForm = false;
+    App.diet.s.editingFoodId = null;
+    App.diet.renderSub();
+  },
+  async saveFood(id) {
+    const food = {
+      name: document.getElementById("food-name").value.trim(),
+      portionLabel: document.getElementById("food-portion").value.trim(),
+      kcal: parseFloat(document.getElementById("food-kcal").value) || 0,
+      proteinG: parseFloat(document.getElementById("food-protein").value) || 0,
+      carbsG: parseFloat(document.getElementById("food-carbs").value) || 0,
+      fatG: parseFloat(document.getElementById("food-fat").value) || 0,
+      note: document.getElementById("food-note").value.trim(),
+    };
+    if (!food.name) return;
+    if (id) {
+      food.id = id;
+      await Repo.updateFood(food);
+    } else {
+      await Repo.addFood(food);
+    }
+    App.diet.s.showFoodForm = false;
+    App.diet.s.editingFoodId = null;
+    await App.diet.refresh();
+  },
+  async removeFood(id) {
+    await Repo.deleteFood(id);
+    await App.diet.refresh();
+  },
+
+  // ---- Peso corporal ----
+  renderWeight() {
+    const logs = App.diet.s.weightLogs;
+    const latest = logs[0];
+    const prev = logs[1];
+    let trendHtml = "";
+    if (latest && prev) {
+      const diff = latest.weightKg - prev.weightKg;
+      const sign = diff > 0 ? "+" : "";
+      trendHtml = `<div class="muted" style="margin-top:6px;">Variación vs. registro anterior: ${sign}${diff.toFixed(1)} kg</div>`;
+    }
+    return `
+      <div class="card">
+        <div class="card-title">Registrar peso</div>
+        <div class="field-row">
+          <div class="field"><label>Fecha</label><input id="weight-date" type="date" value="${Repo.todayStr()}"></div>
+          <div class="field"><label>Peso (kg)</label><input id="weight-value" type="number" step="0.1" placeholder="0.0"></div>
+        </div>
+        <button class="btn btn-primary btn-block" onclick="App.diet.saveWeight()">Guardar</button>
+        ${trendHtml}
+      </div>
+      <div class="card-title" style="margin: 18px 0 8px;">Historial</div>
+      <div class="card">
+        ${
+          logs.length
+            ? logs
+                .map(
+                  (l) => `<div class="set-row">
+              <div>${l.date} — <strong>${fmt1(l.weightKg)} kg</strong></div>
+              <button class="icon-btn danger" onclick="App.diet.removeWeight(${l.id})">${Icons.trash}</button>
+            </div>`
+                )
+                .join("")
+            : `<div class="empty-state">Todavía no registraste tu peso.</div>`
+        }
+      </div>`;
+  },
+
+  async saveWeight() {
+    const date = document.getElementById("weight-date").value || Repo.todayStr();
+    const weight = parseFloat(document.getElementById("weight-value").value);
+    if (isNaN(weight)) return;
+    await Repo.logBodyWeight(date, weight);
+    await App.diet.refresh();
+  },
+  async removeWeight(id) {
+    await Repo.deleteBodyWeightLog(id);
+    await App.diet.refresh();
   },
 };
 

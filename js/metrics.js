@@ -118,4 +118,55 @@ const Metrics = {
       reportedRpe != null && targetRpe != null && Math.abs(reportedRpe - targetRpe) >= threshold;
     return rirOff || rpeOff;
   },
+
+  // -----------------------------------------------------------------------
+  // Dieta — funciones puras de macros (nada de esto toca la DB ni la UI).
+  // -----------------------------------------------------------------------
+
+  /** Suma de kcal/macros de una lista de { food, quantity } donde quantity es un
+   *  múltiplo de la porción base del alimento (ej: quantity=2 = el doble de esa porción). */
+  mealTotals(items) {
+    return items.reduce(
+      (acc, it) => {
+        const q = Number(it.quantity) || 0;
+        return {
+          kcal: acc.kcal + it.food.kcal * q,
+          proteinG: acc.proteinG + it.food.proteinG * q,
+          carbsG: acc.carbsG + it.food.carbsG * q,
+          fatG: acc.fatG + it.food.fatG * q,
+        };
+      },
+      { kcal: 0, proteinG: 0, carbsG: 0, fatG: 0 }
+    );
+  },
+
+  /** BMR por Harris-Benedict (fórmula original de 1919), la misma que usa el plan en PDF. */
+  harrisBenedictBmr(weightKg, heightCm, age, gender) {
+    if (gender === "F") {
+      return 655.1 + 9.563 * weightKg + 1.85 * heightCm - 4.676 * age;
+    }
+    return 66.5 + 13.75 * weightKg + 5.003 * heightCm - 6.75 * age;
+  },
+
+  /** TDEE = BMR x factor de actividad (ej. 1.6 = entrenamiento de fuerza + deporte de contacto). */
+  tdee(bmr, activityFactor) {
+    return bmr * activityFactor;
+  },
+
+  /**
+   * Objetivos diarios sugeridos a partir del perfil: calorías = TDEE + ajuste (negativo en
+   * déficit), proteína = g/kg x peso, grasas = valor fijo en gramos (igual que el plan en PDF,
+   * que no la expresa como %), carbohidratos = resto calórico repartido en el remanente.
+   * Es solo una SUGERENCIA — el usuario puede pisar cualquiera de estos valores a mano.
+   */
+  suggestedMacros(profile) {
+    const bmr = Metrics.harrisBenedictBmr(profile.weightKg, profile.heightCm, profile.age, profile.gender);
+    const tdeeVal = Metrics.tdee(bmr, profile.activityFactor);
+    const targetKcal = Math.round(tdeeVal + (profile.kcalAdjustment || 0));
+    const proteinG = Math.round(profile.proteinPerKg * profile.weightKg);
+    const fatG = Math.round(profile.targetFatG || 0);
+    const carbsKcal = Math.max(0, targetKcal - proteinG * 4 - fatG * 9);
+    const carbsG = Math.round(carbsKcal / 4);
+    return { bmr: Math.round(bmr), tdee: Math.round(tdeeVal), targetKcal, proteinG, carbsG, fatG };
+  },
 };

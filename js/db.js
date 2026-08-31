@@ -2,7 +2,7 @@
 // AppDatabase/Daos/TrainRepository.kt. Todo async vía Promises.
 
 const DB_NAME = "trainmetrics";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function todayStr() {
   const d = new Date();
@@ -61,6 +61,29 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains("muscleGroupTargets")) {
         db.createObjectStore("muscleGroupTargets", { keyPath: "muscleGroup" });
+      }
+      // ---- Módulo de dieta ----
+      if (!db.objectStoreNames.contains("dietProfile")) {
+        // Fila única (id fijo = 1): datos personales + objetivos diarios.
+        db.createObjectStore("dietProfile", { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains("foods")) {
+        // Base de alimentos reusable: cada uno con su porción base y macros de esa porción.
+        db.createObjectStore("foods", { keyPath: "id", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains("dietMeals")) {
+        // Comidas del plan (ej: "Desayuno", "Comida 2"), en orden.
+        db.createObjectStore("dietMeals", { keyPath: "id", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains("dietMealItems")) {
+        // Alimentos dentro de cada comida, con cantidad = múltiplo de la porción base.
+        const s = db.createObjectStore("dietMealItems", { keyPath: "id", autoIncrement: true });
+        s.createIndex("mealId", "mealId");
+      }
+      if (!db.objectStoreNames.contains("bodyWeightLogs")) {
+        // Registro de peso corporal, una entrada por fecha.
+        const s = db.createObjectStore("bodyWeightLogs", { keyPath: "id", autoIncrement: true });
+        s.createIndex("date", "date");
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -340,6 +363,198 @@ const Repo = {
       }
     }
     return counts;
+  },
+
+  // ---------------------------------------------------------------------
+  // Dieta
+  // ---------------------------------------------------------------------
+
+  // ---- Perfil + objetivos diarios ----
+  async getDietProfile() {
+    return getOne("dietProfile", 1);
+  },
+  async upsertDietProfile(profile) {
+    return putRecord("dietProfile", { ...profile, id: 1 });
+  },
+
+  // ---- Alimentos ----
+  async getFoods() {
+    const all = await getAll("foods");
+    return all.sort((a, b) => a.name.localeCompare(b.name));
+  },
+  async getFood(id) {
+    return getOne("foods", id);
+  },
+  async addFood(food) {
+    return addRecord("foods", food);
+  },
+  async updateFood(food) {
+    return putRecord("foods", food);
+  },
+  /** Borra un alimento y también los ítems de comida que lo usaban (para no dejar
+   *  referencias colgantes que después revienten al calcular macros). */
+  async deleteFood(foodId) {
+    const allItems = await getAll("dietMealItems");
+    for (const it of allItems.filter((i) => i.foodId === foodId)) {
+      await deleteRecord("dietMealItems", it.id);
+    }
+    await deleteRecord("foods", foodId);
+  },
+
+  // ---- Comidas del plan ----
+  async getMeals() {
+    const all = await getAll("dietMeals");
+    return all.sort((a, b) => (a.orderIndex ?? 0) - (b.orderIndex ?? 0));
+  },
+  async addMeal(name, scheduleLabel = "") {
+    const existing = await getAll("dietMeals");
+    return addRecord("dietMeals", { name, scheduleLabel, orderIndex: existing.length });
+  },
+  async updateMeal(meal) {
+    return putRecord("dietMeals", meal);
+  },
+  async removeMeal(mealId) {
+    const items = await getAllByIndex("dietMealItems", "mealId", mealId);
+    for (const it of items) await deleteRecord("dietMealItems", it.id);
+    await deleteRecord("dietMeals", mealId);
+  },
+  async moveMeal(mealId, direction) {
+    const meals = await Repo.getMeals();
+    const idx = meals.findIndex((m) => m.id === mealId);
+    const swapIdx = idx + direction;
+    if (idx === -1 || swapIdx < 0 || swapIdx >= meals.length) return;
+    const a = meals[idx];
+    const b = meals[swapIdx];
+    const tmp = a.orderIndex ?? idx;
+    a.orderIndex = b.orderIndex ?? swapIdx;
+    b.orderIndex = tmp;
+    await putRecord("dietMeals", a);
+    await putRecord("dietMeals", b);
+  },
+
+  // ---- Ítems (alimento + cantidad) dentro de una comida ----
+  async getMealItems(mealId) {
+    const items = await getAllByIndex("dietMealItems", "mealId", mealId);
+    return items.sort((a, b) => (a.orderIndex ?? 0) - (b.orderIndex ?? 0));
+  },
+  async addMealItem(mealId, foodId, quantity = 1) {
+    const existing = await getAllByIndex("dietMealItems", "mealId", mealId);
+    return addRecord("dietMealItems", { mealId, foodId, quantity, orderIndex: existing.length });
+  },
+  async updateMealItemQuantity(itemId, quantity) {
+    const item = await getOne("dietMealItems", itemId);
+    if (!item) return;
+    item.quantity = quantity;
+    await putRecord("dietMealItems", item);
+  },
+  async removeMealItem(itemId) {
+    return deleteRecord("dietMealItems", itemId);
+  },
+
+  /** Plan completo: cada comida con sus ítems ya resueltos (alimento + cantidad) y los
+   *  totales de macros de esa comida, más el total del día. Puro join + suma, la fórmula
+   *  de suma en sí vive en Metrics (metrics.js) para mantener el cálculo testeable aparte. */
+  async getDietPlan() {
+    const meals = await Repo.getMeals();
+    const foods = await Repo.getFoods();
+    const foodById = {};
+    foods.forEach((f) => (foodById[f.id] = f));
+    const mealsOut = [];
+    let dayTotals = { kcal: 0, proteinG: 0, carbsG: 0, fatG: 0 };
+    for (const meal of meals) {
+      const items = await Repo.getMealItems(meal.id);
+      const resolved = items
+        .map((it) => ({ ...it, food: foodById[it.foodId] }))
+        .filter((it) => it.food);
+      const totals = Metrics.mealTotals(resolved);
+      dayTotals = {
+        kcal: dayTotals.kcal + totals.kcal,
+        proteinG: dayTotals.proteinG + totals.proteinG,
+        carbsG: dayTotals.carbsG + totals.carbsG,
+        fatG: dayTotals.fatG + totals.fatG,
+      };
+      mealsOut.push({ meal, items: resolved, totals });
+    }
+    return { meals: mealsOut, dayTotals };
+  },
+
+  // ---- Registro de peso corporal ----
+  async getBodyWeightLogs() {
+    const all = await getAll("bodyWeightLogs");
+    return all.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  },
+  /** Get-or-create por fecha: si ya cargaste el peso de hoy, lo actualiza en vez de duplicar. */
+  async logBodyWeight(dateStr, weightKg) {
+    const byDate = await getAllByIndex("bodyWeightLogs", "date", dateStr);
+    const existing = byDate[0];
+    if (existing) {
+      existing.weightKg = weightKg;
+      await putRecord("bodyWeightLogs", existing);
+      return existing.id;
+    }
+    return addRecord("bodyWeightLogs", { date: dateStr, weightKg });
+  },
+  async deleteBodyWeightLog(id) {
+    return deleteRecord("bodyWeightLogs", id);
+  },
+
+  // ---------------------------------------------------------------------
+  // Seed del plan nutricional por defecto (Definición Estética, 2 comidas/día),
+  // cargado por el usuario en PDF. Mismo criterio que seedFase1IfEmpty: se siembra
+  // 1 sola vez por dispositivo, apenas detecta que no hay perfil de dieta todavía,
+  // y no pisa nada si el usuario ya tiene datos cargados.
+  // ---------------------------------------------------------------------
+  async seedDietPlanIfEmpty() {
+    const existingProfile = await Repo.getDietProfile();
+    if (existingProfile) return;
+
+    await Repo.upsertDietProfile({
+      name: "Jose Ignacio Alvarez",
+      age: 22,
+      heightCm: 165,
+      weightKg: 70,
+      gender: "M",
+      activityFactor: 1.6,
+      kcalAdjustment: -500,
+      proteinPerKg: 2.41,
+      targetKcal: 2151,
+      targetProteinG: 169,
+      targetCarbsG: 175,
+      targetFatG: 81,
+      notes:
+        "Objetivo: pérdida de grasa con preservación muscular. 2 comidas diarias, déficit ~500 kcal/día (~0.5% del peso corporal por semana). " +
+        "Día de descanso (2/sem): reducir arroz de 100g a 60g crudo y avena de 80g a 60g crudo (~-220 kcal). " +
+        "Ajuste por falta de progreso: sin pérdida de peso en 2 semanas → 1) sumar 2000 pasos diarios, 2) reducir arroz a 70g y avena a 60g. Nunca reducir proteína ni proteína en polvo. " +
+        "Proteína, omega-3 (vía caballa), carbohidratos y grasas ya están cubiertos según el análisis del plan — no hace falta agregar más fuentes. Vitamina D levemente baja: compensar con sol o D3 1000 UI si hace falta.",
+    });
+
+    const foodDefs = [
+      { key: "avena", name: "Avena (cruda)", portionLabel: "80 g", kcal: 304, proteinG: 11, carbsG: 50, fatG: 6, note: "Cocinar en leche. Ajustada a 80 g para el TDEE actual." },
+      { key: "leche", name: "Leche entera o semi", portionLabel: "400 ml", kcal: 240, proteinG: 13, carbsG: 19, fatG: 10, note: "Base de la avena. Calcio + caseína de digestión lenta." },
+      { key: "proteina", name: "Proteína en polvo", portionLabel: "1 scoop", kcal: 127, proteinG: 25, carbsG: 3, fatG: 2, note: "Mezclar directamente en la avena con leche. Macros aproximados — verificar con tu producto." },
+      { key: "huevos", name: "Huevos enteros", portionLabel: "4 unidades", kcal: 280, proteinG: 24, carbsG: 2, fatG: 20, note: "Perfil aminoacídico completo. Yema: vitaminas A, D, E, colina." },
+      { key: "aceite", name: "Aceite de oliva", portionLabel: "10 ml", kcal: 90, proteinG: 0, carbsG: 0, fatG: 10, note: "Ácido oleico, antiinflamatorio. Usar en crudo o a fuego bajo." },
+      { key: "verdurasCrudas", name: "Verduras crudas (espinaca, tomate, morrón)", portionLabel: "150 g", kcal: 50, proteinG: 3, carbsG: 9, fatG: 0, note: "Vitamina C, hierro, potasio. Elegir variedad de colores." },
+      { key: "pollo", name: "Pechuga de pollo hervida", portionLabel: "300 g cruda (~225 g hervida)", kcal: 330, proteinG: 69, carbsG: 0, fatG: 4, note: "Pesar siempre en crudo. Hervir toda la semana y porcionar (dura hasta 4 días en heladera)." },
+      { key: "caballa", name: "Caballa al natural (lata)", portionLabel: "65 g escurrida", kcal: 120, proteinG: 13, carbsG: 0, fatG: 8, note: "EPA+DHA ~1.0 g. Cubre el mínimo diario de omega-3. Al natural, no en aceite." },
+      { key: "arroz", name: "Arroz blanco (crudo)", portionLabel: "100 g", kcal: 360, proteinG: 7, carbsG: 79, fatG: 1, note: "Alternativa equivalente: 90 g de fideo seco." },
+      { key: "verdurasCocidas", name: "Verduras cocidas (brócoli, zapallo, chaucha)", portionLabel: "200 g", kcal: 70, proteinG: 4, carbsG: 13, fatG: 0, note: "Cocidas al vapor. Fibra insoluble, hierro, folatos. Variar semanalmente." },
+    ];
+    const foodIdByKey = {};
+    for (const f of foodDefs) {
+      const { key, ...rest } = f;
+      foodIdByKey[key] = await Repo.addFood(rest);
+    }
+
+    const desayunoId = await Repo.addMeal("Desayuno", "8:00–10:00 hs");
+    for (const [key, qty] of [["avena", 1], ["leche", 1], ["proteina", 1], ["huevos", 1], ["aceite", 1], ["verdurasCrudas", 1]]) {
+      await Repo.addMealItem(desayunoId, foodIdByKey[key], qty);
+    }
+
+    const comida2Id = await Repo.addMeal("Comida 2 — Tarde/Noche", "15:00–19:00 hs");
+    for (const [key, qty] of [["pollo", 1], ["caballa", 1], ["arroz", 1], ["aceite", 2], ["verdurasCocidas", 1]]) {
+      await Repo.addMealItem(comida2Id, foodIdByKey[key], qty);
+    }
   },
 
   // ---------------------------------------------------------------------
