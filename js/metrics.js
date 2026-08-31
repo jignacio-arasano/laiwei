@@ -169,4 +169,147 @@ const Metrics = {
     const carbsG = Math.round(carbsKcal / 4);
     return { bmr: Math.round(bmr), tdee: Math.round(tdeeVal), targetKcal, proteinG, carbsG, fatG };
   },
+
+  // -----------------------------------------------------------------------
+  // Estancamiento — cruza entrenamiento (volumen/fatiga) con dieta (peso,
+  // déficit, proteína) para sugerir la causa más probable, siguiendo el
+  // marco de Chris Beardsley: un plateau real puede venir de fatiga
+  // acumulada (exceso de volumen), de un déficit calórico demasiado
+  // agresivo/sostenido, de proteína insuficiente (~1.6 g/kg es el piso
+  // razonable para retener masa magra en déficit), o de un estímulo de
+  // entrenamiento que ya no supera el umbral necesario para seguir
+  // progresando ("inadequate stimulus").
+  // -----------------------------------------------------------------------
+
+  /**
+   * Tendencia de peso corporal en kg/semana a partir de bodyWeightLogs
+   * (se acepta en cualquier orden). Negativo = está bajando de peso.
+   * Regresión lineal simple sobre día vs. peso; devuelve null si hay
+   * menos de 2 registros o si todavía no cubren minSpanDays.
+   */
+  weightTrendKgPerWeek(logs, minSpanDays = 10) {
+    if (!logs || logs.length < 2) return null;
+    const sorted = logs.slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    const t0 = new Date(sorted[0].date).getTime();
+    const points = sorted.map((l) => ({
+      x: (new Date(l.date).getTime() - t0) / 86400000,
+      y: l.weightKg,
+    }));
+    const spanDays = points[points.length - 1].x;
+    if (spanDays < minSpanDays) return null;
+
+    const n = points.length;
+    const sumX = points.reduce((a, p) => a + p.x, 0);
+    const sumY = points.reduce((a, p) => a + p.y, 0);
+    const sumXY = points.reduce((a, p) => a + p.x * p.y, 0);
+    const sumXX = points.reduce((a, p) => a + p.x * p.x, 0);
+    const denom = n * sumXX - sumX * sumX;
+    if (denom === 0) return null;
+    const slopePerDay = (n * sumXY - sumX * sumY) / denom;
+    return slopePerDay * 7;
+  },
+
+  /**
+   * Diagnóstico de estancamiento. Recibe:
+   * - volumeRows: [{ muscleGroup, setCount, target, zone, fatiguedExerciseCount }]
+   *   (mismo shape que arma la pantalla Volumen)
+   * - weightTrendKgPerWeek: número o null (ver función de arriba)
+   * - bodyWeightKg: peso actual de referencia, o null
+   * - profile: dietProfile (kcalAdjustment, proteinPerKg, ...) o null
+   * - weightLogsCount: cantidad de registros de peso cargados
+   * Devuelve { causes: [...], verdict, deficitPctPerWeek, hasTrainingData, hasWeightData }
+   * ordenado por severidad (alta > media > baja). No toca DB ni UI.
+   */
+  plateauDiagnosis({ volumeRows, weightTrendKgPerWeek, bodyWeightKg, profile, weightLogsCount }) {
+    const rows = volumeRows || [];
+    const hasTrainingData = rows.length > 0;
+    const causes = [];
+
+    const overMrvFatigued = rows.filter((r) => r.zone === "SOBRE_MRV" && r.fatiguedExerciseCount > 0);
+    if (overMrvFatigued.length > 0) {
+      causes.push({
+        type: "EXCESO_VOLUMEN",
+        severity: "alta",
+        title: "Volumen excesivo",
+        detail: `${overMrvFatigued.map((r) => r.muscleGroup).join(", ")} está(n) por encima del MRV y con ejercicios en fatiga. El volumen extra puede estar generando más fatiga/inflamación de la que recuperás entre sesiones, tapando el progreso real. Probá un deload esta semana en esos grupos.`,
+      });
+    }
+
+    const totalFatigued = rows.reduce((a, r) => a + r.fatiguedExerciseCount, 0);
+    const anyOverMrv = rows.some((r) => r.zone === "SOBRE_MRV");
+    if (totalFatigued > 0 && !anyOverMrv) {
+      causes.push({
+        type: "FATIGA_SIN_EXCESO_VOLUMEN",
+        severity: "media",
+        title: "Fatiga sin exceso de volumen",
+        detail: "Hay ejercicios rindiendo por debajo de su piso reciente, pero el volumen semanal no está pasado de rosca. Apunta más a un problema de recuperación externo al entrenamiento en sí — revisá sueño y estrés, y sobre todo las señales de dieta de abajo.",
+      });
+    }
+
+    let deficitPctPerWeek = null;
+    if (weightTrendKgPerWeek != null && bodyWeightKg) {
+      deficitPctPerWeek = (-weightTrendKgPerWeek / bodyWeightKg) * 100;
+    }
+    const inDeficit = !!(profile && (profile.kcalAdjustment || 0) < 0);
+
+    if (deficitPctPerWeek != null) {
+      if (deficitPctPerWeek >= 1.0) {
+        causes.push({
+          type: "DEFICIT_AGRESIVO",
+          severity: deficitPctPerWeek >= 1.5 ? "alta" : "media",
+          title: "Ritmo de pérdida de peso alto",
+          detail: `Venís bajando ~${deficitPctPerWeek.toFixed(2)}%/semana de tu peso corporal (el objetivo del plan es ~0.5%/semana). Un déficit sostenido más agresivo que eso golpea la capacidad de adaptación al entrenamiento — considerá subir un poco las calorías o meter una semana de mantenimiento.`,
+        });
+      } else if (Math.abs(deficitPctPerWeek) < 0.1 && inDeficit && (weightLogsCount || 0) >= 4) {
+        causes.push({
+          type: "MESETA_DE_PESO",
+          severity: "media",
+          title: "El peso no se mueve pese al déficit planificado",
+          detail: "Según tus registros, el peso está prácticamente estancado a pesar de tener un déficit calórico fijado. Según tu propio plan: si no hay pérdida en 2 semanas, sumá ~2000 pasos diarios y/o bajá arroz y avena antes de tocar la proteína.",
+        });
+      }
+    }
+
+    if (profile && profile.proteinPerKg != null && profile.proteinPerKg < 1.6) {
+      causes.push({
+        type: "PROTEINA_BAJA",
+        severity: "alta",
+        title: "Proteína por debajo del umbral",
+        detail: `Tu objetivo actual es ${profile.proteinPerKg} g/kg. Por debajo de ~1.6 g/kg, en déficit, la retención de masa muscular se resiente y el estancamiento se vuelve más probable. Subí la proteína objetivo en "Perfil".`,
+      });
+    }
+
+    const noneAtOrAboveMav =
+      hasTrainingData && rows.every((r) => r.zone === "BAJO_MEV" || r.zone === "EN_MEV_MAV" || r.zone == null);
+    if (causes.length === 0 && hasTrainingData && noneAtOrAboveMav) {
+      causes.push({
+        type: "ESTIMULO_INSUFICIENTE",
+        severity: "media",
+        title: "Estímulo de entrenamiento posiblemente insuficiente",
+        detail: "No hay señales de fatiga ni de exceso de volumen, y varios grupos están corriendo cerca o por debajo del MEV. Si venís estancado en fuerza, el volumen/esfuerzo actual puede ya no superar el umbral necesario para seguir progresando — probá acercarte más al MAV en esos grupos.",
+      });
+    }
+
+    let verdict;
+    if (!hasTrainingData) {
+      verdict = "Todavía no hay suficientes series cargadas esta semana para un diagnóstico.";
+    } else if (causes.length === 0) {
+      verdict = "No se detectan señales claras de estancamiento en los datos actuales — volumen, fatiga y dieta están dentro de rango.";
+    } else if (causes.length === 1) {
+      verdict = "Se detectó una causa probable de estancamiento:";
+    } else {
+      verdict = "Se detectaron varias causas probables de estancamiento (ordenadas por relevancia):";
+    }
+
+    const order = { alta: 0, media: 1, baja: 2 };
+    causes.sort((a, b) => order[a.severity] - order[b.severity]);
+
+    return {
+      causes,
+      verdict,
+      deficitPctPerWeek,
+      hasTrainingData,
+      hasWeightData: (weightLogsCount || 0) >= 2,
+    };
+  },
 };

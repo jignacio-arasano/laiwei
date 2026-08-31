@@ -365,6 +365,41 @@ const Repo = {
     return counts;
   },
 
+  /** Arma el diagnóstico de estancamiento cruzando volumen/fatiga semanal (igual que la
+   *  pantalla Volumen) con peso corporal y perfil de dieta. Devuelve directamente el
+   *  resultado de Metrics.plateauDiagnosis, listo para pintar. */
+  async plateauSignals() {
+    const volumeByGroup = await Repo.currentWeekVolumeByMuscleGroup();
+    const fatiguedByGroup = await Repo.fatiguedExercisesByMuscleGroup();
+    const groups = new Set([...Object.keys(volumeByGroup), ...Object.keys(fatiguedByGroup)]);
+    const volumeRows = [];
+    for (const group of groups) {
+      const target = await Repo.getMuscleGroupTarget(group);
+      const setCount = volumeByGroup[group] || 0;
+      const zone = target ? Metrics.volumeZone(setCount, target.mev, target.mav, target.mrv) : null;
+      volumeRows.push({
+        muscleGroup: group,
+        setCount,
+        target,
+        zone,
+        fatiguedExerciseCount: fatiguedByGroup[group] || 0,
+      });
+    }
+
+    const weightLogs = await Repo.getBodyWeightLogs();
+    const profile = await Repo.getDietProfile();
+    const weightTrendKgPerWeek = Metrics.weightTrendKgPerWeek(weightLogs);
+    const bodyWeightKg = weightLogs[0]?.weightKg ?? profile?.weightKg ?? null;
+
+    return Metrics.plateauDiagnosis({
+      volumeRows,
+      weightTrendKgPerWeek,
+      bodyWeightKg,
+      profile,
+      weightLogsCount: weightLogs.length,
+    });
+  },
+
   // ---------------------------------------------------------------------
   // Dieta
   // ---------------------------------------------------------------------

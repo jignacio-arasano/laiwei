@@ -211,8 +211,8 @@ App.session = {
       let html = `<div class="chip-row">`;
       html += s.routineExercises
         .map(
-          (ex) =>
-            `<button class="chip ${s.selectedExerciseId === ex.id ? "selected" : ""}" onclick="App.session.selectExercise(${ex.id})">${escapeHtml(ex.name)}</button>`
+          (ex, i) =>
+            `<button class="chip ${s.selectedExerciseId === ex.id ? "selected" : ""}" onclick="App.session.selectExercise(${ex.id})"><span class="chip-order">${i + 1}</span> ${escapeHtml(ex.name)}</button>`
         )
         .join("");
       html += `<button class="chip ghost" onclick="App.session.toggleAdHoc()">+ otro ejercicio</button>`;
@@ -868,6 +868,7 @@ App.diet = {
     plan: { meals: [], dayTotals: { kcal: 0, proteinG: 0, carbsG: 0, fatG: 0 } },
     foods: [],
     weightLogs: [],
+    plateau: null,
     addingFoodToMeal: null,
     pickedFoodId: null,
     showNewMeal: false,
@@ -881,6 +882,7 @@ App.diet = {
     s.plan = await Repo.getDietPlan();
     s.foods = await Repo.getFoods();
     s.weightLogs = await Repo.getBodyWeightLogs();
+    s.plateau = await Repo.plateauSignals();
   },
 
   async refresh() {
@@ -902,6 +904,7 @@ App.diet = {
           <button class="chip ${s.subview === "profile" ? "selected" : ""}" onclick="App.diet.goSub('profile')">Perfil</button>
           <button class="chip ${s.subview === "foods" ? "selected" : ""}" onclick="App.diet.goSub('foods')">Alimentos</button>
           <button class="chip ${s.subview === "weight" ? "selected" : ""}" onclick="App.diet.goSub('weight')">Peso</button>
+          <button class="chip ${s.subview === "analysis" ? "selected" : ""}" onclick="App.diet.goSub('analysis')">Estancamiento</button>
         </div>
         <div id="diet-subview"></div>
       </div>`;
@@ -926,7 +929,54 @@ App.diet = {
       el.innerHTML = App.diet.renderFoods();
     } else if (s.subview === "weight") {
       el.innerHTML = App.diet.renderWeight();
+    } else if (s.subview === "analysis") {
+      el.innerHTML = App.diet.renderAnalysis();
     }
+  },
+
+  // ---- Estancamiento (cruza volumen/fatiga de entrenamiento con dieta) ----
+  renderAnalysis() {
+    const p = App.diet.s.plateau;
+    if (!p) return `<div class="muted">Cargando...</div>`;
+
+    let html = `<div class="card">
+      <div class="card-title">¿Por qué me estanco?</div>
+      <div class="muted" style="margin-top:2px;">
+        Cruza el volumen y la fatiga de esta semana (pestaña Volumen) con tu peso corporal y tu perfil de dieta,
+        para sugerir la causa más probable de un plateau: exceso de volumen, déficit demasiado agresivo,
+        proteína insuficiente, o estímulo de entrenamiento insuficiente.
+      </div>
+    </div>`;
+
+    if (!p.hasTrainingData) {
+      html += `<div class="empty-state">Cargá series de trabajo esta semana para poder diagnosticar.</div>`;
+      return html;
+    }
+
+    if (p.deficitPctPerWeek != null) {
+      const sign = p.deficitPctPerWeek >= 0 ? "-" : "+";
+      html += `<div class="muted" style="margin: 10px 2px;">Ritmo de cambio de peso: ${sign}${Math.abs(p.deficitPctPerWeek).toFixed(2)}%/semana del peso corporal.</div>`;
+    } else if (!p.hasWeightData) {
+      html += `<div class="muted" style="margin: 10px 2px;">Cargá al menos un par de registros de peso (pestaña "Peso", separados por más de una semana) para incluir la señal de déficit en el diagnóstico.</div>`;
+    }
+
+    html += `<div class="card-title" style="margin: 14px 0 8px;">${escapeHtml(p.verdict)}</div>`;
+
+    if (p.causes.length === 0) {
+      html += `<div class="card accent">Todo dentro de rango por ahora — seguí con el plan actual.</div>`;
+    } else {
+      const cardCls = { alta: "danger", media: "warn", baja: "" };
+      const sevLabel = { alta: "Prioridad alta", media: "Prioridad media", baja: "Prioridad baja" };
+      html += p.causes
+        .map(
+          (c) => `<div class="card ${cardCls[c.severity] || ""}" style="margin-bottom:10px;">
+            <div class="row"><strong>${escapeHtml(c.title)}</strong><span class="zone-label" style="color:var(--text-muted);">${sevLabel[c.severity] || ""}</span></div>
+            <div class="muted" style="margin-top:4px;">${escapeHtml(c.detail)}</div>
+          </div>`
+        )
+        .join("");
+    }
+    return html;
   },
 
   // ---- Plan de comidas ----

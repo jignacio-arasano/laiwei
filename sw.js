@@ -1,7 +1,7 @@
 // Service worker mínimo: cachea los archivos de la app para que funcione offline
 // y sea instalable ("Agregar a pantalla de inicio"). No cachea nada de red externa
 // porque la app no usa red — todo el guardado es local vía IndexedDB (ver js/db.js).
-const CACHE_NAME = "trainmetrics-v5";
+const CACHE_NAME = "trainmetrics-v6";
 const ASSETS = [
   "./",
   "./index.html",
