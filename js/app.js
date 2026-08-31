@@ -137,6 +137,9 @@ App.session = {
     calibrationWarnings: [],
     showAdHocPicker: false,
     showCreateExercise: false,
+    newExerciseSecondaryGroups: [],
+    editingExercise: false,
+    editSecondaryGroups: [],
   },
 
   async load() {
@@ -260,6 +263,22 @@ App.session = {
       <div class="field"><label>Nombre</label><input id="new-ex-name" placeholder="Ej: Press banca"></div>
       <div class="field"><label>Grupo muscular</label><input id="new-ex-group" placeholder="Ej: ${escapeHtml(s.muscleGroups.slice(0, 2).join(", ") || "pecho")}"></div>
       <div class="field"><label>Equipo (opcional)</label><input id="new-ex-equip" placeholder="Ej: barra"></div>
+      ${
+        s.muscleGroups.length > 0
+          ? `<div class="field">
+              <label>Músculos secundarios (opcional)</label>
+              <div class="chip-row">
+                ${s.muscleGroups
+                  .map(
+                    (g) =>
+                      `<button class="chip small ${s.newExerciseSecondaryGroups.includes(g) ? "selected" : ""}" onclick="App.session.toggleNewExerciseSecondaryGroup('${escapeHtml(g)}')">${escapeHtml(g)}</button>`
+                  )
+                  .join("")}
+              </div>
+              <div class="muted" style="margin-top:4px;">Grupos que este ejercicio fatiga de forma indirecta (ej: peso muerto → lumbares/isquios).</div>
+            </div>`
+          : ""
+      }
       <button class="btn btn-primary btn-block" onclick="App.session.createExercise()">Crear y elegir</button>
     </div>`;
   },
@@ -269,7 +288,16 @@ App.session = {
     App.session.render();
   },
   toggleCreateExercise() {
-    App.session.s.showCreateExercise = !App.session.s.showCreateExercise;
+    const s = App.session.s;
+    s.showCreateExercise = !s.showCreateExercise;
+    if (s.showCreateExercise) s.newExerciseSecondaryGroups = [];
+    App.session.render();
+  },
+  toggleNewExerciseSecondaryGroup(group) {
+    const s = App.session.s;
+    const idx = s.newExerciseSecondaryGroups.indexOf(group);
+    if (idx === -1) s.newExerciseSecondaryGroups.push(group);
+    else s.newExerciseSecondaryGroups.splice(idx, 1);
     App.session.render();
   },
 
@@ -278,8 +306,10 @@ App.session = {
     const group = document.getElementById("new-ex-group").value.trim();
     const equip = document.getElementById("new-ex-equip").value.trim();
     if (!name || !group) return;
-    const id = await Repo.addExercise(name, group, equip);
+    const secondary = App.session.s.newExerciseSecondaryGroups.filter((g) => g !== group);
+    const id = await Repo.addExercise(name, group, equip, secondary);
     App.session.s.showCreateExercise = false;
+    App.session.s.newExerciseSecondaryGroups = [];
     App.session.s.exercises = await Repo.getActiveExercises();
     App.session.s.muscleGroups = await Repo.getMuscleGroups();
     await App.session.selectExercise(id);
@@ -348,7 +378,23 @@ App.session = {
     const exercise = s.exercises.find((e) => e.id === s.selectedExerciseId);
     const nextPlanned = s.plannedSets.find((p) => p.setNumber === App.session.nextWorkingSetNumber());
 
-    let html = `
+    let html = "";
+    if (exercise) {
+      html += `<div class="row" style="margin-bottom:8px;">
+        <div>
+          <strong>${escapeHtml(exercise.name)}</strong>
+          <div class="muted" style="font-size:12px;">${escapeHtml(exercise.muscleGroup)}${
+            exercise.secondaryMuscleGroups && exercise.secondaryMuscleGroups.length
+              ? ` · secundario: ${escapeHtml(exercise.secondaryMuscleGroups.join(", "))}`
+              : ""
+          }</div>
+        </div>
+        <button class="icon-btn" onclick="App.session.toggleEditExercise()">${Icons.edit}</button>
+      </div>`;
+      if (s.editingExercise) html += App.session.renderExerciseEditForm(exercise);
+    }
+
+    html += `
       <div class="card">
         <div class="card-title">Referencia para decidir el peso de hoy</div>
         ${
@@ -488,6 +534,64 @@ App.session = {
   async deleteSet(id) {
     await Repo.deleteSet(id);
     await App.session.refreshExerciseData();
+    App.session.renderExerciseDetail();
+  },
+
+  // ---- Edición de ejercicio (grupo muscular + secundarios) ----
+  toggleEditExercise() {
+    const s = App.session.s;
+    s.editingExercise = !s.editingExercise;
+    if (s.editingExercise) {
+      const exercise = s.exercises.find((e) => e.id === s.selectedExerciseId);
+      s.editSecondaryGroups = (exercise?.secondaryMuscleGroups || []).slice();
+    }
+    App.session.renderExerciseDetail();
+  },
+
+  renderExerciseEditForm(exercise) {
+    const s = App.session.s;
+    return `<div class="card" style="box-shadow:none; border:1px dashed var(--border); margin-bottom:10px;">
+      <div class="field"><label>Grupo muscular principal</label><input id="edit-ex-group" value="${escapeHtml(exercise.muscleGroup)}"></div>
+      <div class="field">
+        <label>Músculos secundarios</label>
+        <div class="chip-row">
+          ${s.muscleGroups
+            .filter((g) => g !== exercise.muscleGroup)
+            .map(
+              (g) =>
+                `<button class="chip small ${s.editSecondaryGroups.includes(g) ? "selected" : ""}" onclick="App.session.toggleEditSecondaryGroup('${escapeHtml(g)}')">${escapeHtml(g)}</button>`
+            )
+            .join("")}
+        </div>
+        <div class="muted" style="margin-top:4px;">Grupos que este ejercicio fatiga de forma indirecta (ej: peso muerto → lumbares/isquios).</div>
+      </div>
+      <div class="row">
+        <button class="btn btn-ghost" onclick="App.session.toggleEditExercise()">Cancelar</button>
+        <button class="btn btn-primary" onclick="App.session.saveExerciseEdit()">Guardar</button>
+      </div>
+    </div>`;
+  },
+
+  toggleEditSecondaryGroup(group) {
+    const s = App.session.s;
+    const idx = s.editSecondaryGroups.indexOf(group);
+    if (idx === -1) s.editSecondaryGroups.push(group);
+    else s.editSecondaryGroups.splice(idx, 1);
+    App.session.renderExerciseDetail();
+  },
+
+  async saveExerciseEdit() {
+    const s = App.session.s;
+    const exercise = s.exercises.find((e) => e.id === s.selectedExerciseId);
+    if (!exercise) return;
+    const group = document.getElementById("edit-ex-group").value.trim();
+    if (!group) return;
+    exercise.muscleGroup = group;
+    exercise.secondaryMuscleGroups = s.editSecondaryGroups.filter((g) => g !== group);
+    await Repo.updateExercise(exercise);
+    s.editingExercise = false;
+    s.exercises = await Repo.getActiveExercises();
+    s.muscleGroups = await Repo.getMuscleGroups();
     App.session.renderExerciseDetail();
   },
 };
@@ -751,7 +855,7 @@ App.session.refreshRoutineExercisesIfNeeded = async function (routineId) {
 // Volumen semanal
 // =======================================================================
 App.volume = {
-  s: { rows: [], editing: {} },
+  s: { rows: [], editing: {}, systemic: null },
 
   async load() {
     const volumeByGroup = await Repo.currentWeekVolumeByMuscleGroup();
@@ -772,6 +876,7 @@ App.volume = {
     }
     rows.sort((a, b) => a.muscleGroup.localeCompare(b.muscleGroup));
     App.volume.s.rows = rows;
+    App.volume.s.systemic = await Repo.systemicFatigueSignals();
   },
 
   async refresh() {
@@ -782,12 +887,22 @@ App.volume = {
   render() {
     const s = App.volume.s;
     const el = document.getElementById("view-volume");
+    let systemicBanner = "";
+    if (s.systemic && s.systemic.totalEligible >= 3 && s.systemic.ratio != null && s.systemic.ratio >= 0.3) {
+      const pct = Math.round(s.systemic.ratio * 100);
+      const cls = s.systemic.ratio >= 0.5 ? "danger" : "warn";
+      systemicBanner = `<div class="card ${cls}">
+        <strong>⚠ Fatiga sistémica: ${pct}% de tus ejercicios con historial suficiente (${s.systemic.totalFatigued}/${s.systemic.totalEligible}) vienen rindiendo por debajo de su piso.</strong>
+        <div class="muted" style="margin-top:4px;">Señal transversal a varios grupos musculares — considerá una semana de deload general, no solo puntual.</div>
+      </div>`;
+    }
     el.innerHTML = `
       <div class="topbar">
         <h1>Volumen semanal</h1>
         <div class="subtitle">Series de trabajo de esta semana (lunes a domingo) contra tus propias bandas</div>
       </div>
       <div class="view">
+        ${systemicBanner}
         ${
           s.rows.length === 0
             ? `<div class="empty-state">Todavía no cargaste series de trabajo esta semana.</div>`

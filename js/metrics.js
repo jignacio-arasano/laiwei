@@ -181,24 +181,47 @@ const Metrics = {
   // progresando ("inadequate stimulus").
   // -----------------------------------------------------------------------
 
+  /** Media móvil centrada de windowSize puntos (no depende de que los días sean regulares). */
+  _movingAveragePoints(points, windowSize = 3) {
+    const half = Math.floor(windowSize / 2);
+    return points.map((p, i) => {
+      const start = Math.max(0, i - half);
+      const end = Math.min(points.length, i + half + 1);
+      const slice = points.slice(start, end);
+      const avgY = slice.reduce((a, q) => a + q.y, 0) / slice.length;
+      return { x: p.x, y: avgY };
+    });
+  },
+
   /**
    * Tendencia de peso corporal en kg/semana a partir de bodyWeightLogs
    * (se acepta en cualquier orden). Negativo = está bajando de peso.
    * Regresión lineal simple sobre día vs. peso; devuelve null si hay
    * menos de 2 registros o si todavía no cubren minSpanDays.
+   *
+   * Si el registro es denso (poca separación promedio entre pesadas — típico
+   * de pesarse casi todos los días), se aplica antes una media móvil de 3
+   * puntos para amortiguar la variabilidad hídrica día a día (agua, sodio,
+   * digestión) sin comprometer la sensibilidad de la regresión a la
+   * tendencia real. Con registros espaciados (ej. 1 vez por semana) no hay
+   * ruido de corto plazo que suavizar, así que se usan los puntos crudos.
    */
   weightTrendKgPerWeek(logs, minSpanDays = 10) {
     if (!logs || logs.length < 2) return null;
     const sorted = logs.slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
     const t0 = new Date(sorted[0].date).getTime();
-    const points = sorted.map((l) => ({
+    const rawPoints = sorted.map((l) => ({
       x: (new Date(l.date).getTime() - t0) / 86400000,
       y: l.weightKg,
     }));
-    const spanDays = points[points.length - 1].x;
+    const spanDays = rawPoints[rawPoints.length - 1].x;
     if (spanDays < minSpanDays) return null;
 
-    const n = points.length;
+    const n = rawPoints.length;
+    const avgGapDays = spanDays / (n - 1);
+    const points =
+      avgGapDays <= 2.5 && n >= 5 ? Metrics._movingAveragePoints(rawPoints, 3) : rawPoints;
+
     const sumX = points.reduce((a, p) => a + p.x, 0);
     const sumY = points.reduce((a, p) => a + p.y, 0);
     const sumXY = points.reduce((a, p) => a + p.x * p.y, 0);
@@ -217,10 +240,14 @@ const Metrics = {
    * - bodyWeightKg: peso actual de referencia, o null
    * - profile: dietProfile (kcalAdjustment, proteinPerKg, ...) o null
    * - weightLogsCount: cantidad de registros de peso cargados
+   * - fatigueSignals: { totalFatigued, totalEligible, ratio, crossFatigueByGroup } o null
+   *   (ver Repo.systemicFatigueSignals en db.js) — fatiga transversal/global y fatiga
+   *   atribuida a músculos SECUNDARIOS de ejercicios fatigados (ej. peso muerto fatigado
+   *   también carga la zona lumbar/isquios como secundario).
    * Devuelve { causes: [...], verdict, deficitPctPerWeek, hasTrainingData, hasWeightData }
    * ordenado por severidad (alta > media > baja). No toca DB ni UI.
    */
-  plateauDiagnosis({ volumeRows, weightTrendKgPerWeek, bodyWeightKg, profile, weightLogsCount }) {
+  plateauDiagnosis({ volumeRows, weightTrendKgPerWeek, bodyWeightKg, profile, weightLogsCount, fatigueSignals }) {
     const rows = volumeRows || [];
     const hasTrainingData = rows.length > 0;
     const causes = [];
@@ -246,26 +273,75 @@ const Metrics = {
       });
     }
 
+    // Fatiga sistémica global: proporción de ejercicios con historial suficiente que
+    // vienen rindiendo por debajo de su piso, sin importar el grupo muscular. Cuando es
+    // alta, la causa raíz suele ser transversal (sueño, estrés, déficit) más que un grupo
+    // puntual pasado de volumen.
+    if (fatigueSignals && fatigueSignals.totalEligible >= 3 && fatigueSignals.ratio != null && fatigueSignals.ratio >= 0.3) {
+      const pct = Math.round(fatigueSignals.ratio * 100);
+      causes.push({
+        type: "FATIGA_SISTEMICA_GLOBAL",
+        severity: fatigueSignals.ratio >= 0.5 ? "alta" : "media",
+        title: "Fatiga sistémica transversal",
+        detail: `${pct}% de tus ejercicios con historial suficiente (${fatigueSignals.totalFatigued}/${fatigueSignals.totalEligible}) vienen rindiendo por debajo de su piso reciente, repartido entre varios grupos musculares. Esto apunta a fatiga acumulada a nivel general (sistema nervioso, sueño, estrés, déficit) más que a un solo grupo con exceso de volumen — considerá un deload global de toda la semana, no solo puntual.`,
+      });
+    }
+
+    // Fatiga cruzada por músculos secundarios: ejercicios en fatiga cuyo movimiento
+    // también carga, de forma secundaria, a otro grupo muscular — ese grupo puede estar
+    // rindiendo mal por una razón que no aparece mirándolo de forma aislada.
+    if (fatigueSignals && fatigueSignals.crossFatigueByGroup) {
+      const crossGroups = Object.entries(fatigueSignals.crossFatigueByGroup).filter(([, count]) => count >= 2);
+      if (crossGroups.length > 0) {
+        causes.push({
+          type: "FATIGA_CRUZADA_SECUNDARIA",
+          severity: "media",
+          title: "Fatiga cruzada vía músculos secundarios",
+          detail: `${crossGroups.map(([g, c]) => `${g} (${c})`).join(", ")} está(n) recibiendo fatiga indirecta de ejercicios fatigados que los trabajan como músculo secundario (ej. peso muerto fatigado → lumbares/isquios). Si ese grupo también viene estancado, puede no ser un problema propio sino un arrastre de la fatiga de otro ejercicio.`,
+        });
+      }
+    }
+
     let deficitPctPerWeek = null;
     if (weightTrendKgPerWeek != null && bodyWeightKg) {
       deficitPctPerWeek = (-weightTrendKgPerWeek / bodyWeightKg) * 100;
     }
-    const inDeficit = !!(profile && (profile.kcalAdjustment || 0) < 0);
 
-    if (deficitPctPerWeek != null) {
-      if (deficitPctPerWeek >= 1.0) {
+    if (deficitPctPerWeek != null && deficitPctPerWeek >= 1.0) {
+      causes.push({
+        type: "DEFICIT_AGRESIVO",
+        severity: deficitPctPerWeek >= 1.5 ? "alta" : "media",
+        title: "Ritmo de pérdida de peso alto",
+        detail: `Venís bajando ~${deficitPctPerWeek.toFixed(2)}%/semana de tu peso corporal (el objetivo del plan es ~0.5%/semana). Un déficit sostenido más agresivo que eso golpea la capacidad de adaptación al entrenamiento — considerá subir un poco las calorías o meter una semana de mantenimiento.`,
+      });
+    }
+
+    // Ajuste dinámico de TDEE: compara el cambio de peso TEÓRICO que implica el
+    // kcalAdjustment del perfil (vía la conversión ~7700 kcal ≈ 1kg de grasa) contra el
+    // cambio REAL medido en la tendencia de peso. Cuando hay una brecha sostenida, el TDEE
+    // real es distinto al calculado (BMR/Harris-Benedict + factor de actividad son
+    // estimaciones) — se sugiere un ajuste concreto en kcal/día en vez de solo señalar
+    // "meseta".
+    if (
+      profile &&
+      (profile.kcalAdjustment || 0) !== 0 &&
+      weightTrendKgPerWeek != null &&
+      (weightLogsCount || 0) >= 4
+    ) {
+      const expectedWeeklyChangeKg = (profile.kcalAdjustment * 7) / 7700;
+      const gapKgPerWeek = expectedWeeklyChangeKg - weightTrendKgPerWeek;
+      if (Math.abs(gapKgPerWeek) >= 0.1) {
+        const kcalPerDayAdjust = Math.round((gapKgPerWeek * 7700) / 7);
+        const suggestedKcalAdjustment = Math.round(profile.kcalAdjustment - kcalPerDayAdjust);
+        const detail =
+          gapKgPerWeek > 0
+            ? `Tu plan actual (${Math.round(profile.kcalAdjustment)} kcal/día de ajuste) implica bajar ~${Math.abs(expectedWeeklyChangeKg).toFixed(2)}kg/semana, pero tus registros muestran ~${Math.abs(weightTrendKgPerWeek).toFixed(2)}kg/semana real — estás perdiendo más despacio de lo esperado. Tu gasto real (TDEE) parece ser más alto que el calculado. Para alinear el ritmo, bajá el ajuste calórico a ~${suggestedKcalAdjustment} kcal/día (unas ${Math.abs(kcalPerDayAdjust)} kcal menos por día).`
+            : `Tu plan actual (${Math.round(profile.kcalAdjustment)} kcal/día de ajuste) implica un cambio de ~${expectedWeeklyChangeKg.toFixed(2)}kg/semana, pero tus registros muestran ~${weightTrendKgPerWeek.toFixed(2)}kg/semana real — te estás moviendo más rápido de lo planeado. Tu gasto real (TDEE) parece ser distinto al calculado. Para alinear el ritmo, subí el ajuste calórico a ~${suggestedKcalAdjustment} kcal/día (unas ${Math.abs(kcalPerDayAdjust)} kcal más por día).`;
         causes.push({
-          type: "DEFICIT_AGRESIVO",
-          severity: deficitPctPerWeek >= 1.5 ? "alta" : "media",
-          title: "Ritmo de pérdida de peso alto",
-          detail: `Venís bajando ~${deficitPctPerWeek.toFixed(2)}%/semana de tu peso corporal (el objetivo del plan es ~0.5%/semana). Un déficit sostenido más agresivo que eso golpea la capacidad de adaptación al entrenamiento — considerá subir un poco las calorías o meter una semana de mantenimiento.`,
-        });
-      } else if (Math.abs(deficitPctPerWeek) < 0.1 && inDeficit && (weightLogsCount || 0) >= 4) {
-        causes.push({
-          type: "MESETA_DE_PESO",
-          severity: "media",
-          title: "El peso no se mueve pese al déficit planificado",
-          detail: "Según tus registros, el peso está prácticamente estancado a pesar de tener un déficit calórico fijado. Según tu propio plan: si no hay pérdida en 2 semanas, sumá ~2000 pasos diarios y/o bajá arroz y avena antes de tocar la proteína.",
+          type: "AJUSTE_TDEE",
+          severity: Math.abs(gapKgPerWeek) >= 0.25 ? "alta" : "media",
+          title: "El ritmo real no coincide con el calculado — ajustar TDEE",
+          detail,
         });
       }
     }

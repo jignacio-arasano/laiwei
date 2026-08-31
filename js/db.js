@@ -143,11 +143,15 @@ const Repo = {
   todayStr,
 
   // ---- Exercises ----
-  async addExercise(name, muscleGroup, equipment = "") {
-    return addRecord("exercises", { name, muscleGroup, equipment, archived: false });
+  async addExercise(name, muscleGroup, equipment = "", secondaryMuscleGroups = []) {
+    return addRecord("exercises", { name, muscleGroup, equipment, secondaryMuscleGroups, archived: false });
   },
   async getExercise(id) {
     return getOne("exercises", id);
+  },
+  /** Actualiza un ejercicio existente (grupo muscular principal, secundarios, etc). */
+  async updateExercise(exercise) {
+    return putRecord("exercises", exercise);
   },
   async getActiveExercises() {
     const all = await getAll("exercises");
@@ -365,6 +369,42 @@ const Repo = {
     return counts;
   },
 
+  /** Fatiga transversal/sistémica: recorre TODOS los ejercicios activos con historial
+   *  suficiente (más de 2 sesiones de trabajo distintas, mismo mínimo que usa
+   *  Metrics.isInFatigue para no arriesgar falsos positivos) y devuelve:
+   *  - totalFatigued / totalEligible / ratio: proporción global en fatiga, sin importar
+   *    el grupo muscular — una ratio alta sugiere un problema transversal (sueño, estrés,
+   *    déficit) más que un grupo puntual pasado de volumen.
+   *  - crossFatigueByGroup: cuántos ejercicios EN FATIGA tienen a cada grupo como músculo
+   *    SECUNDARIO (ej. peso muerto fatigado también carga lumbares/isquios) — permite
+   *    atribuirle a un grupo una fatiga que no aparece mirándolo de forma aislada. */
+  async systemicFatigueSignals() {
+    const exercises = await Repo.getActiveExercises();
+    let totalFatigued = 0;
+    let totalEligible = 0;
+    const crossFatigueByGroup = {};
+    for (const exercise of exercises) {
+      const history = await Repo.exerciseHistory(exercise.id);
+      const workingDates = new Set(
+        history.filter((h) => COUNTS_AS_WORK.has(h.set.setType)).map((h) => h.date)
+      );
+      if (workingDates.size <= 2) continue; // mismo umbral que Metrics.isInFatigue (lookbackSessions=2)
+      totalEligible += 1;
+      if (Metrics.isInFatigue(history)) {
+        totalFatigued += 1;
+        for (const group of exercise.secondaryMuscleGroups || []) {
+          crossFatigueByGroup[group] = (crossFatigueByGroup[group] || 0) + 1;
+        }
+      }
+    }
+    return {
+      totalFatigued,
+      totalEligible,
+      ratio: totalEligible > 0 ? totalFatigued / totalEligible : null,
+      crossFatigueByGroup,
+    };
+  },
+
   /** Arma el diagnóstico de estancamiento cruzando volumen/fatiga semanal (igual que la
    *  pantalla Volumen) con peso corporal y perfil de dieta. Devuelve directamente el
    *  resultado de Metrics.plateauDiagnosis, listo para pintar. */
@@ -390,6 +430,7 @@ const Repo = {
     const profile = await Repo.getDietProfile();
     const weightTrendKgPerWeek = Metrics.weightTrendKgPerWeek(weightLogs);
     const bodyWeightKg = weightLogs[0]?.weightKg ?? profile?.weightKg ?? null;
+    const fatigueSignals = await Repo.systemicFatigueSignals();
 
     return Metrics.plateauDiagnosis({
       volumeRows,
@@ -397,6 +438,7 @@ const Repo = {
       bodyWeightKg,
       profile,
       weightLogsCount: weightLogs.length,
+      fatigueSignals,
     });
   },
 
