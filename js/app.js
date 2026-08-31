@@ -101,7 +101,7 @@ const App = {
       });
       if (view === "volume") App.volume.refresh();
       if (view === "routines") App.routines.render();
-      if (view === "session") App.session.render();
+      if (view === "session") App.session.refresh();
     },
   },
 
@@ -178,6 +178,16 @@ App.session = {
 
     document.getElementById("view-session").innerHTML = html;
     App.session.renderExerciseDetail();
+  },
+
+  /** Se llama al volver a la pestaña Sesión — refresca el orden de ejercicios de la
+   *  rutina elegida por si se reordenaron desde la pestaña Rutinas mientras tanto. */
+  async refresh() {
+    const s = App.session.s;
+    if (s.selectedRoutineId !== null) {
+      s.routineExercises = await Repo.getRoutineExercises(s.selectedRoutineId);
+    }
+    App.session.render();
   },
 
   renderExercisePicker() {

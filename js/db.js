@@ -230,12 +230,26 @@ const Repo = {
     }
     await deleteRecord("routines", routineId);
   },
+  /** Devuelve los routineExercises de una rutina, ORDENADOS, garantizando que todos
+   *  tengan orderIndex. Los registros viejos (creados antes de que existiera el campo
+   *  orderIndex) no lo tienen, y comparar undefined-undefined da NaN, lo que deja el
+   *  orden "como caiga" en IndexedDB — por eso acá migramos esos casos una sola vez,
+   *  asignando el orden según el id (orden de creación original) y persistiéndolo. */
+  async _orderedRoutineExercises(routineId) {
+    const exs = await getAllByIndex("routineExercises", "routineId", routineId);
+    const missing = exs.some((e) => typeof e.orderIndex !== "number");
+    if (!missing) return exs.sort((a, b) => a.orderIndex - b.orderIndex);
+    const sorted = exs.slice().sort((a, b) => a.id - b.id);
+    for (let i = 0; i < sorted.length; i++) {
+      sorted[i].orderIndex = i;
+      await putRecord("routineExercises", sorted[i]);
+    }
+    return sorted;
+  },
   async getRoutineDetail(routineId) {
     const routine = await getOne("routines", routineId);
     if (!routine) return null;
-    const exs = (await getAllByIndex("routineExercises", "routineId", routineId)).sort(
-      (a, b) => a.orderIndex - b.orderIndex
-    );
+    const exs = await Repo._orderedRoutineExercises(routineId);
     const entries = [];
     for (const re of exs) {
       const exercise = await getOne("exercises", re.exerciseId);
@@ -281,9 +295,7 @@ const Repo = {
   /** Mueve un ejercicio de la rutina un lugar hacia arriba (-1) o abajo (+1), swapeando
    *  orderIndex con el vecino. No hace nada si ya está en la punta correspondiente. */
   async reorderRoutineExercise(routineId, routineExerciseId, direction) {
-    const exs = (await getAllByIndex("routineExercises", "routineId", routineId)).sort(
-      (a, b) => a.orderIndex - b.orderIndex
-    );
+    const exs = await Repo._orderedRoutineExercises(routineId);
     const idx = exs.findIndex((e) => e.id === routineExerciseId);
     const swapIdx = idx + direction;
     if (idx === -1 || swapIdx < 0 || swapIdx >= exs.length) return;
@@ -299,9 +311,7 @@ const Repo = {
    *  mostrar ejercicios que no pertenecen a la rutina elegida. */
   async getRoutineExercises(routineId) {
     if (!routineId) return [];
-    const exs = (await getAllByIndex("routineExercises", "routineId", routineId)).sort(
-      (a, b) => a.orderIndex - b.orderIndex
-    );
+    const exs = await Repo._orderedRoutineExercises(routineId);
     const out = [];
     for (const re of exs) {
       const exercise = await getOne("exercises", re.exerciseId);
