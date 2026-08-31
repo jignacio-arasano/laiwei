@@ -278,6 +278,23 @@ const Repo = {
     for (const p of planned) await deleteRecord("plannedSets", p.id);
     await deleteRecord("routineExercises", routineExerciseId);
   },
+  /** Mueve un ejercicio de la rutina un lugar hacia arriba (-1) o abajo (+1), swapeando
+   *  orderIndex con el vecino. No hace nada si ya está en la punta correspondiente. */
+  async reorderRoutineExercise(routineId, routineExerciseId, direction) {
+    const exs = (await getAllByIndex("routineExercises", "routineId", routineId)).sort(
+      (a, b) => a.orderIndex - b.orderIndex
+    );
+    const idx = exs.findIndex((e) => e.id === routineExerciseId);
+    const swapIdx = idx + direction;
+    if (idx === -1 || swapIdx < 0 || swapIdx >= exs.length) return;
+    const a = exs[idx];
+    const b = exs[swapIdx];
+    const tmp = a.orderIndex;
+    a.orderIndex = b.orderIndex;
+    b.orderIndex = tmp;
+    await putRecord("routineExercises", a);
+    await putRecord("routineExercises", b);
+  },
   /** Ejercicios de la rutina de hoy, EN ORDEN — usado por la pantalla de Sesión para no
    *  mostrar ejercicios que no pertenecen a la rutina elegida. */
   async getRoutineExercises(routineId) {

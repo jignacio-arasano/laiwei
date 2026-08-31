@@ -6,6 +6,7 @@ const COUNTS_AS_WORK = new Set(["NORMAL", "AMRAP", "DROP", "MYOREP", "BACKOFF"])
 const SET_TYPES = [
   { value: "APPROACH", label: "Aproximación" },
   { value: "WARMUP", label: "Entrada en calor" },
+  { value: "PAP", label: "PAP" },
   { value: "NORMAL", label: "Normal" },
   { value: "AMRAP", label: "AMRAP" },
   { value: "DROP", label: "Drop set" },

@@ -8,6 +8,8 @@ const Icons = {
   volume: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="4" y2="12"/><line x1="10" y1="20" x2="10" y2="6"/><line x1="16" y1="20" x2="16" y2="14"/><line x1="21" y1="20" x2="3" y2="20"/></svg>`,
   trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
   back: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>`,
+  up: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`,
+  down: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
 };
 
 function escapeHtml(str) {
@@ -307,6 +309,15 @@ App.session = {
     s.plannedSets = await Repo.getPlannedSetsForRoutineExercise(s.selectedRoutineId, exerciseId);
   },
 
+  /** Número de la próxima serie DE TRABAJO (para matchear contra el objetivo de la rutina).
+   *  Las series de aproximación/entrada en calor/PAP no cuentan — así "serie 1" del objetivo
+   *  sigue siendo la primera serie efectiva, sin importar cuántas series previas de calentamiento
+   *  se hayan cargado antes. */
+  nextWorkingSetNumber() {
+    const s = App.session.s;
+    return s.setsLoggedToday.filter((set) => COUNTS_AS_WORK.has(set.setType)).length + 1;
+  },
+
   renderExerciseDetail() {
     const s = App.session.s;
     const el = document.getElementById("session-exercise-detail");
@@ -316,8 +327,7 @@ App.session = {
       return;
     }
     const exercise = s.exercises.find((e) => e.id === s.selectedExerciseId);
-    const nextSetNumber = s.setsLoggedToday.length + 1;
-    const nextPlanned = s.plannedSets.find((p) => p.setNumber === nextSetNumber);
+    const nextPlanned = s.plannedSets.find((p) => p.setNumber === App.session.nextWorkingSetNumber());
 
     let html = `
       <div class="card">
@@ -384,8 +394,8 @@ App.session = {
         <div class="card-title">Cargar serie</div>
         <div class="chip-row" id="set-type-chips">
           ${SET_TYPES.map(
-            (t, i) =>
-              `<button class="chip small ${i === 2 ? "selected" : ""}" data-settype="${t.value}" onclick="App.session.pickSetType('${t.value}')">${t.label}</button>`
+            (t) =>
+              `<button class="chip small ${t.value === "NORMAL" ? "selected" : ""}" data-settype="${t.value}" onclick="App.session.pickSetType('${t.value}')">${t.label}</button>`
           ).join("")}
         </div>
         <div class="section-gap"></div>
@@ -422,8 +432,12 @@ App.session = {
     const rpe = rpeRaw === "" ? null : parseFloat(rpeRaw);
     const note = document.getElementById("set-note").value.trim();
     const setType = App.session._setType;
+    // setNumber guarda el orden real en que se cargó (incluye aproximación/calentamiento),
+    // solo se usa para ordenar la lista "Series de hoy". El objetivo de la rutina, en cambio,
+    // se matchea contra el número de serie DE TRABAJO (ver nextWorkingSetNumber).
     const nextSetNumber = s.setsLoggedToday.length + 1;
-    const plannedSet = s.plannedSets.find((p) => p.setNumber === nextSetNumber);
+    const nextWorkingSetNumber = App.session.nextWorkingSetNumber();
+    const plannedSet = s.plannedSets.find((p) => p.setNumber === nextWorkingSetNumber);
 
     await Repo.addSet({
       sessionId: s.sessionId,
@@ -443,7 +457,7 @@ App.session = {
       Metrics.calibrationMismatch(rir, plannedSet.targetRir, rpe, plannedSet.targetRpe)
     ) {
       s.calibrationWarnings.push(
-        `Serie ${nextSetNumber}: te desviaste del objetivo (objetivo RIR ${orDash(plannedSet.targetRir)} / RPE ${orDash(plannedSet.targetRpe)}, diste RIR ${orDash(rir)} / RPE ${orDash(rpe)})`
+        `Serie ${nextWorkingSetNumber}: te desviaste del objetivo (objetivo RIR ${orDash(plannedSet.targetRir)} / RPE ${orDash(plannedSet.targetRpe)}, diste RIR ${orDash(rir)} / RPE ${orDash(rpe)})`
       );
     }
 
@@ -568,10 +582,14 @@ App.routines = {
             ? `<div class="empty-state">Todavía no agregaste ejercicios a esta rutina.</div>`
             : detail.entries
                 .map(
-                  (entry) => `<div class="card">
+                  (entry, i) => `<div class="card">
               <div class="row">
-                <strong>${escapeHtml(entry.exercise.name)}</strong>
-                <button class="icon-btn danger" onclick="App.routines.removeExercise(${entry.routineExerciseId})">${Icons.trash}</button>
+                <strong>${i + 1}. ${escapeHtml(entry.exercise.name)}</strong>
+                <div class="row" style="gap:2px; flex:0 0 auto;">
+                  <button class="icon-btn" ${i === 0 ? "disabled" : ""} onclick="App.routines.moveExercise(${entry.routineExerciseId}, -1)">${Icons.up}</button>
+                  <button class="icon-btn" ${i === detail.entries.length - 1 ? "disabled" : ""} onclick="App.routines.moveExercise(${entry.routineExerciseId}, 1)">${Icons.down}</button>
+                  <button class="icon-btn danger" onclick="App.routines.removeExercise(${entry.routineExerciseId})">${Icons.trash}</button>
+                </div>
               </div>
               ${entry.plannedSets
                 .map((p) => `<div class="muted" style="margin-top:4px;">Serie ${p.setNumber}: ${p.targetReps} reps @ RIR ${orDash(p.targetRir)} / RPE ${orDash(p.targetRpe)}</div>`)
@@ -687,6 +705,14 @@ App.routines = {
   async removeExercise(routineExerciseId) {
     const s = App.routines.s;
     await Repo.removeExerciseFromRoutine(routineExerciseId);
+    s.detail = await Repo.getRoutineDetail(s.detailId);
+    App.routines.render();
+    App.session.refreshRoutineExercisesIfNeeded(s.detailId);
+  },
+
+  async moveExercise(routineExerciseId, direction) {
+    const s = App.routines.s;
+    await Repo.reorderRoutineExercise(s.detailId, routineExerciseId, direction);
     s.detail = await Repo.getRoutineDetail(s.detailId);
     App.routines.render();
     App.session.refreshRoutineExercisesIfNeeded(s.detailId);

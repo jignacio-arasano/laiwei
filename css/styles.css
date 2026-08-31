@@ -223,6 +223,7 @@ h1, h2, h3, h4 { margin: 0; font-weight: 700; letter-spacing: -0.01em; }
 }
 .icon-btn svg { width: 18px; height: 18px; }
 .icon-btn.danger { color: var(--danger); }
+.icon-btn:disabled { opacity: .25; pointer-events: none; }
 
 /* ---------- Rows / lists ---------- */
 
